@@ -20,6 +20,7 @@
 #if HT_AMD && HT_LINUX
 
 #include <hip_test_aqllog.hh>
+#include <hip/hip_ext.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -66,7 +67,47 @@ void runBarrierScenario(const std::string& scenario) {
   hipStream_t stream_c = nullptr;
   HIP_CHECK(hipStreamCreate(&stream_a));
 
-  if (scenario == "same_stream") {
+  if (scenario == "graph_any_order") {
+    // Captured ordered, any-order (hipExtAnyOrderLaunch), ordered kernels.
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    HIP_CHECK(hipStreamBeginCapture(stream_a, hipStreamCaptureModeGlobal));
+    launchBarrierTestKernel(stream_a, 21);
+    hipExtLaunchKernelGGL(noopKernel, dim3(1), dim3(22), 0, stream_a, nullptr, nullptr,
+                          hipExtAnyOrderLaunch);
+    HIP_CHECK(hipGetLastError());
+    launchBarrierTestKernel(stream_a, 23);
+    HIP_CHECK(hipStreamEndCapture(stream_a, &graph));
+    HIP_CHECK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+    HIP_CHECK(hipGraphLaunch(graph_exec, stream_a));
+    HIP_CHECK(hipStreamSynchronize(stream_a));
+    HIP_CHECK(hipGraphExecDestroy(graph_exec));
+    HIP_CHECK(hipGraphDestroy(graph));
+  } else if (scenario == "graph_any_order_update") {
+    // An exec captured with an any-order kernel, updated from an ordered capture before launch.
+    auto capture = [stream_a](uint32_t flags) {
+      hipGraph_t graph = nullptr;
+      HIP_CHECK(hipStreamBeginCapture(stream_a, hipStreamCaptureModeGlobal));
+      launchBarrierTestKernel(stream_a, 21);
+      hipExtLaunchKernelGGL(noopKernel, dim3(1), dim3(22), 0, stream_a, nullptr, nullptr, flags);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipStreamEndCapture(stream_a, &graph));
+      return graph;
+    };
+    hipGraph_t any_order_graph = capture(hipExtAnyOrderLaunch);
+    hipGraph_t ordered_graph = capture(0);
+    hipGraphExec_t graph_exec = nullptr;
+    HIP_CHECK(hipGraphInstantiate(&graph_exec, any_order_graph, nullptr, nullptr, 0));
+    hipGraphNode_t error_node = nullptr;
+    hipGraphExecUpdateResult update_result = hipGraphExecUpdateError;
+    HIP_CHECK(hipGraphExecUpdate(graph_exec, ordered_graph, &error_node, &update_result));
+    REQUIRE(update_result == hipGraphExecUpdateSuccess);
+    HIP_CHECK(hipGraphLaunch(graph_exec, stream_a));
+    HIP_CHECK(hipStreamSynchronize(stream_a));
+    HIP_CHECK(hipGraphExecDestroy(graph_exec));
+    HIP_CHECK(hipGraphDestroy(ordered_graph));
+    HIP_CHECK(hipGraphDestroy(any_order_graph));
+  } else if (scenario == "same_stream") {
     launchBarrierTestKernel(stream_a, 17);
     launchBarrierTestKernel(stream_a, 18);
     launchBarrierTestKernel(stream_a, 19);
@@ -242,6 +283,17 @@ HIP_TEST_CASE(Unit_hipStreamAqlBarrierBit_Scenarios) {
     REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 18) == 0);
     REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 19) == 0);
     REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 20) == 1);
+  }
+
+  SECTION("Captured hipExtAnyOrderLaunch kernel keeps its barrier bit clear") {
+    const std::string log = runBarrierScenarioChild("graph_any_order");
+    REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 22) == 0);
+    REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 23) == 1);
+  }
+
+  SECTION("Graph exec update takes the launch flags of the new kernel node") {
+    const std::string log = runBarrierScenarioChild("graph_any_order_update");
+    REQUIRE(aqllog::DispatchBarrierBitForWorkgroup(log, 22) == 1);
   }
 
   SECTION("Event record and wait preserve stream ordering") {
